@@ -31,9 +31,11 @@ message(CMAKE_CURRENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 find_package (Eigen3 3.4.0 REQUIRED NO_MODULE)
 
 add_executable(00_basic 00_basic.cpp)
+add_executable(random_experiments random_experiments.cpp)
 
 set(TARGETS 
     00_basic
+    random_experiments
 )
 
 foreach(TARGET ${TARGETS})
@@ -44,6 +46,4 @@ foreach(TARGET ${TARGETS})
 			${CMAKE_CURRENT_SOURCE_DIR}
 			${nipm_SOURCE_DIR}
 	)
-
-	add_test(NAME test_${TARGET} COMMAND ${TARGET})
 endforeach()

@@ -2,7 +2,7 @@
 #include <iostream>
 
 #include <Eigen/Dense>
-#include <daqp.hpp>
+#include <daqp/daqp.hpp>
 #include "lexls_interface.hpp"
 #include "nipm_interface.hpp"
 
