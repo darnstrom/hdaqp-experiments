@@ -71,6 +71,19 @@ Hierarchy create_random_hierarchy(int nh, int n, int mmax, double equality_prob)
     return h;
 }
 
+double compute_lexdiff(Eigen::VectorXd s1, Eigen::VectorXd s2, Eigen::VectorXi breaks, double tol = 1e-9){
+    double diff,w1,w2;
+    for(int i = 0; i < breaks.size() - 1; i++){
+        w1 = s1.segment(breaks(i),breaks(i+1)-breaks(i)).squaredNorm();
+        w2 = s2.segment(breaks(i),breaks(i+1)-breaks(i)).squaredNorm();
+        //std::cout << w1 << " | " << w2 << std::endl; 
+        diff = w1-w2; 
+        if(abs(diff) > tol)
+            return diff;
+    }
+    return 0.0;
+} 
+
 
 int main() {
 
@@ -86,12 +99,15 @@ int main() {
     int n = 50;
     int mmax = 20;
 
-    Eigen::VectorXd  eq_probs = (Eigen::VectorXd(11) <<0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0).finished();
+    Eigen::VectorXd eq_probs = (Eigen::VectorXd(11) <<0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0).finished();
 
-    int Nruns = 1000;
+    int Nruns = 100;
     Eigen::MatrixXd times(Nruns,3);
+    Eigen::MatrixXd daqp_diff_lexls(Nruns,eq_probs.size());
+    Eigen::MatrixXd daqp_diff_nipm(Nruns,eq_probs.size());
 
     for (int i = 0; i < eq_probs.size(); i++){
+        printf("Running %d / %d \n",i+1, static_cast<int>(eq_probs.size())); 
         Eigen::MatrixXd times(Nruns,3);
         double equality_prob = eq_probs(i);
         for (int run = 0; run < Nruns; run++){
@@ -113,13 +129,22 @@ int main() {
             auto lexls_time = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start);
             times(run,1) = std::chrono::duration<double>(lexls_time).count();
 
-            // NIPM-HLSP
+            //// NIPM-HLSP
             auto nipm = nipm_from_stack(h.matrix, h.upper, h.lower, h.breaks);
             t_start = std::chrono::high_resolution_clock::now();
             nipm.solve();
             t_end = std::chrono::high_resolution_clock::now();
             auto nipm_time = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start);
             times(run,2) = std::chrono::duration<double>(nipm_time).count();
+
+
+            // Compute slacks
+            Eigen::VectorXd w_daqp = compute_slacks(h.matrix,h.upper,h.lower,daqp.get_primal());
+            Eigen::VectorXd w_lexls = compute_slacks(h.matrix,h.upper,h.lower,lexls.get_x());
+            Eigen::VectorXd w_nipm = compute_slacks(h.matrix,h.upper,h.lower,nipm.get_x());
+
+            daqp_diff_lexls(run,i) = compute_lexdiff(w_daqp,w_lexls,h.breaks);
+            daqp_diff_nipm(run,i) = compute_lexdiff(w_daqp,w_nipm,h.breaks);
         }
 
         // Append to file
@@ -128,7 +153,15 @@ int main() {
         output_file << times.colwise().mean() << " ";
         output_file << times.colwise().maxCoeff();
         output_file << std::endl;
+
     }
 
     output_file.close();
+
+    std::ofstream output_file_diff_lexls("daqp_diff_lexls.dat");
+    output_file_diff_lexls << daqp_diff_lexls;
+    output_file_diff_lexls.close();
+    std::ofstream output_file_diff_nipm("daqp_diff_nipm.dat");
+    output_file_diff_nipm << daqp_diff_nipm;
+    output_file_diff_nipm.close();
 }
