@@ -22,7 +22,7 @@ LexLS::internal::LexLSI lexls_from_stack(Eigen::MatrixXd const& matrix,
 
     LexLS::internal::LexLSI lexls(matrix.cols(), n_tasks, &number_of_constraints[0], &types_of_objectives[0]);
     LexLS::ParametersLexLSI parameters;
-    // parameters.output_file_name = "lexls_log.txt";
+    parameters.max_number_of_factorizations = 1000; // To ensure lexls gives the optimal solution 
     lexls.setParameters(parameters);
 
     for (int k = 0; k < n_tasks; ++k) {
