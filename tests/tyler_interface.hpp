@@ -1,17 +1,21 @@
 #pragma once
 
-#include <string>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <Eigen/Dense>
-#include "Highs.h"
+#include <Highs.h>
 
 #include "hierarchy_utils.hpp"
 
 struct TylerResult {
     Eigen::VectorXd primal;
+    Eigen::VectorXd mip_primal;
     int first_failed_level = -1;
     double violation = 0.0;
     bool all_levels_satisfied = false;
@@ -19,180 +23,202 @@ struct TylerResult {
 
 namespace tyler_detail {
 
-constexpr double kInf = 1.0e30;
+inline void require_highs_ok(HighsStatus status, std::string const& context) {
+    if (status != HighsStatus::kOk) {
+        throw std::runtime_error("HiGHS error while " + context);
+    }
+}
 
-struct HighsLpResult {
-    bool optimal = false;
-    std::string status;
-    Eigen::VectorXd primal;
-    double objective = 0.0;
-};
+inline void require_model_solution(Highs const& highs, std::string const& context) {
+    HighsModelStatus const model_status = highs.getModelStatus();
+    if (model_status != HighsModelStatus::kOptimal &&
+        model_status != HighsModelStatus::kObjectiveBound &&
+        model_status != HighsModelStatus::kObjectiveTarget) {
+        throw std::runtime_error("HiGHS failed while " + context +
+                                 " (model status " +
+                                 std::to_string(static_cast<int>(model_status)) + ")");
+    }
+}
 
-inline HighsLpResult solve_lp(Eigen::MatrixXd const& A,
-                              Eigen::VectorXd const& row_lower,
-                              Eigen::VectorXd const& row_upper,
-                              Eigen::VectorXd const& col_cost,
-                              Eigen::VectorXd const& col_lower,
-                              Eigen::VectorXd const& col_upper) {
-    Highs highs;
-    highs.setOptionValue("output_flag", false);
-    highs.addCols(static_cast<HighsInt>(A.cols()),
-                  col_cost.data(),
-                  col_lower.data(),
-                  col_upper.data(),
-                  0,
-                  nullptr,
-                  nullptr,
-                  nullptr);
+inline double max_abs(Eigen::VectorXd const& vector) {
+    return vector.size() == 0 ? 0.0 : vector.cwiseAbs().maxCoeff();
+}
 
-    std::vector<HighsInt> indices;
-    std::vector<double> values;
-    indices.reserve(static_cast<std::size_t>(A.cols()));
-    values.reserve(static_cast<std::size_t>(A.cols()));
+inline double tyler_variable_bound(Eigen::MatrixXd const& matrix,
+                                   Eigen::VectorXd const& upper,
+                                   Eigen::VectorXd const& lower) {
+    double const bound_scale = std::max({1.0, max_abs(upper), max_abs(lower)});
+    double const dimension_scale = std::sqrt(static_cast<double>(std::max<Eigen::Index>(1, matrix.cols())));
+    return std::max(10.0, 10.0 * bound_scale * dimension_scale + 1.0);
+}
 
-    for (Eigen::Index row = 0; row < A.rows(); ++row) {
-        indices.clear();
-        values.clear();
-        for (Eigen::Index col = 0; col < A.cols(); ++col) {
-            double const value = A(row, col);
-            if (value == 0.0) {
-                continue;
-            }
-            indices.push_back(static_cast<HighsInt>(col));
-            values.push_back(value);
+inline std::vector<double> row_relaxation_bounds(Eigen::MatrixXd const& matrix,
+                                                 Eigen::VectorXd const& upper,
+                                                 Eigen::VectorXd const& lower,
+                                                 double variable_bound) {
+    std::vector<double> row_bounds(static_cast<std::size_t>(matrix.rows()), 0.0);
+    for (Eigen::Index row = 0; row < matrix.rows(); ++row) {
+        double const activity_bound = matrix.row(row).cwiseAbs().sum() * variable_bound;
+        double const upper_violation = std::max(0.0, activity_bound - upper(row));
+        double const lower_violation = std::max(0.0, activity_bound + lower(row));
+        row_bounds[static_cast<std::size_t>(row)] = std::max(upper_violation, lower_violation);
+    }
+    return row_bounds;
+}
+
+inline std::vector<double> level_relaxation_bounds(std::vector<HierarchyLevelRange> const& ranges,
+                                                   std::vector<double> const& row_bounds) {
+    std::vector<double> level_bounds(ranges.size(), 0.0);
+    for (std::size_t level = 0; level < ranges.size(); ++level) {
+        double bound = 0.0;
+        for (int row = ranges[level].start; row < ranges[level].end; ++row) {
+            bound = std::max(bound, row_bounds[static_cast<std::size_t>(row)]);
         }
-
-        highs.addRow(row_lower(row),
-                     row_upper(row),
-                     static_cast<HighsInt>(indices.size()),
-                     indices.empty() ? nullptr : indices.data(),
-                     values.empty() ? nullptr : values.data());
+        level_bounds[level] = bound;
     }
-
-    highs.run();
-
-    HighsLpResult result;
-    result.status = highs.modelStatusToString(highs.getModelStatus());
-    result.optimal = result.status == "Optimal";
-    if (!result.optimal) {
-        return result;
-    }
-
-    HighsSolution const& solution = highs.getSolution();
-    result.objective = highs.getInfo().objective_function_value;
-    result.primal = Eigen::Map<Eigen::VectorXd const>(solution.col_value.data(),
-                                                      static_cast<Eigen::Index>(solution.col_value.size()));
-    return result;
+    return level_bounds;
 }
 
-inline HighsLpResult solve_exact_prefix(Eigen::MatrixXd const& matrix,
-                                        Eigen::VectorXd const& upper,
-                                        Eigen::VectorXd const& lower,
-                                        std::vector<HierarchyLevelRange> const& ranges,
-                                        int last_level) {
-    if (last_level < 0) {
-        HighsLpResult result;
-        result.optimal = true;
-        result.status = "Optimal";
-        result.primal = Eigen::VectorXd::Zero(matrix.cols());
-        return result;
-    }
-
-    int const prefix_end = ranges[static_cast<std::size_t>(last_level)].end;
-    Eigen::MatrixXd A = matrix.topRows(prefix_end);
-    Eigen::VectorXd row_upper = upper.head(prefix_end);
-    Eigen::VectorXd row_lower = lower.head(prefix_end);
-    Eigen::VectorXd col_cost = Eigen::VectorXd::Zero(matrix.cols());
-    Eigen::VectorXd col_lower = Eigen::VectorXd::Constant(matrix.cols(), -kInf);
-    Eigen::VectorXd col_upper = Eigen::VectorXd::Constant(matrix.cols(), kInf);
-    return solve_lp(A, row_lower, row_upper, col_cost, col_lower, col_upper);
-}
-
-inline HighsLpResult solve_relaxed_level(Eigen::MatrixXd const& matrix,
-                                         Eigen::VectorXd const& upper,
-                                         Eigen::VectorXd const& lower,
-                                         std::vector<HierarchyLevelRange> const& ranges,
-                                         int level) {
-    HierarchyLevelRange const range = ranges[static_cast<std::size_t>(level)];
-    int const exact_rows = range.start;
-    int const relaxed_rows = range.end - range.start;
-    int const total_rows = exact_rows + 2 * relaxed_rows;
-    int const n = matrix.cols();
-
-    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(total_rows, n + 1);
-    Eigen::VectorXd row_lower = Eigen::VectorXd::Constant(total_rows, -kInf);
-    Eigen::VectorXd row_upper = Eigen::VectorXd::Constant(total_rows, kInf);
-
-    if (exact_rows > 0) {
-        A.block(0, 0, exact_rows, n) = matrix.topRows(exact_rows);
-        row_lower.head(exact_rows) = lower.head(exact_rows);
-        row_upper.head(exact_rows) = upper.head(exact_rows);
-    }
-
-    for (int i = 0; i < relaxed_rows; ++i) {
-        int const src = range.start + i;
-
-        A.block(exact_rows + i, 0, 1, n) = matrix.row(src);
-        A(exact_rows + i, n) = -1.0;
-        row_upper(exact_rows + i) = upper(src);
-
-        A.block(exact_rows + relaxed_rows + i, 0, 1, n) = matrix.row(src);
-        A(exact_rows + relaxed_rows + i, n) = 1.0;
-        row_lower(exact_rows + relaxed_rows + i) = lower(src);
-    }
-
-    Eigen::VectorXd col_cost = Eigen::VectorXd::Zero(n + 1);
-    col_cost(n) = 1.0;
-
-    Eigen::VectorXd col_lower = Eigen::VectorXd::Constant(n + 1, -kInf);
-    Eigen::VectorXd col_upper = Eigen::VectorXd::Constant(n + 1, kInf);
-    col_lower(n) = 0.0;
-
-    return solve_lp(A, row_lower, row_upper, col_cost, col_lower, col_upper);
-}
-
-} // namespace tyler_detail
+}  // namespace tyler_detail
 
 inline TylerResult tyler_from_stack(Eigen::MatrixXd const& matrix,
                                     Eigen::VectorXd const& upper,
                                     Eigen::VectorXd const& lower,
                                     Eigen::VectorXi const& breaks) {
-    auto const ranges = hierarchy_level_ranges(breaks, matrix.rows());
     TylerResult result;
     result.primal = Eigen::VectorXd::Zero(matrix.cols());
+    result.mip_primal = Eigen::VectorXd::Zero(matrix.cols());
 
+    auto const ranges = hierarchy_level_ranges(breaks, matrix.rows());
     if (ranges.empty()) {
         result.all_levels_satisfied = true;
         return result;
     }
 
-    tyler_detail::HighsLpResult last_feasible;
-    bool have_last_feasible = false;
+    double const x_bound = tyler_detail::tyler_variable_bound(matrix, upper, lower);
+    std::vector<double> const row_bounds = tyler_detail::row_relaxation_bounds(matrix, upper, lower, x_bound);
+    std::vector<double> const level_bounds = tyler_detail::level_relaxation_bounds(ranges, row_bounds);
+    double const phi_upper =
+        std::max(1.0, *std::max_element(level_bounds.begin(), level_bounds.end()));
+    double const objective_weight = phi_upper + 1.0;
 
-    for (int level = 0; level < static_cast<int>(ranges.size()); ++level) {
-        auto prefix = tyler_detail::solve_exact_prefix(matrix, upper, lower, ranges, level);
-        if (prefix.optimal) {
-            last_feasible = std::move(prefix);
-            have_last_feasible = true;
-            continue;
-        }
+    Highs highs;
+    tyler_detail::require_highs_ok(highs.setOptionValue("output_flag", false), "disabling output");
+    tyler_detail::require_highs_ok(highs.setOptionValue("log_to_console", false), "disabling console log");
+    tyler_detail::require_highs_ok(highs.setOptionValue("mip_rel_gap", 0.0), "setting mip_rel_gap");
+    tyler_detail::require_highs_ok(highs.setOptionValue("mip_abs_gap", 0.0), "setting mip_abs_gap");
 
-        auto relaxed = tyler_detail::solve_relaxed_level(matrix, upper, lower, ranges, level);
-        if (!relaxed.optimal) {
-            throw std::runtime_error("Tyler/HiGHS solve failed for level " + std::to_string(level) +
-                                     " with status: " + relaxed.status);
-        }
+    int const n = static_cast<int>(matrix.cols());
+    int const levels = static_cast<int>(ranges.size());
 
-        result.primal = relaxed.primal.head(matrix.cols());
-        result.first_failed_level = level;
-        result.violation = relaxed.primal(matrix.cols());
-        result.all_levels_satisfied = false;
-        return result;
+    std::vector<int> x_index(static_cast<std::size_t>(n));
+    std::vector<int> l_index(static_cast<std::size_t>(levels));
+    for (int col = 0; col < n; ++col) {
+        x_index[static_cast<std::size_t>(col)] = static_cast<int>(highs.getNumCol());
+        tyler_detail::require_highs_ok(highs.addCol(0.0, -x_bound, x_bound, 0, nullptr, nullptr),
+                                       "adding primal variables");
+    }
+    for (int level = 0; level < levels; ++level) {
+        l_index[static_cast<std::size_t>(level)] = static_cast<int>(highs.getNumCol());
+        tyler_detail::require_highs_ok(highs.addCol(0.0, 0.0, 1.0, 0, nullptr, nullptr),
+                                       "adding level indicators");
+        tyler_detail::require_highs_ok(
+            highs.changeColIntegrality(l_index[static_cast<std::size_t>(level)], HighsVarType::kInteger),
+            "setting level indicators to binary");
+    }
+    int const phi_index = static_cast<int>(highs.getNumCol());
+    tyler_detail::require_highs_ok(highs.addCol(0.0, 0.0, phi_upper, 0, nullptr, nullptr),
+                                   "adding phi variable");
+
+    for (int level = 0; level + 1 < levels; ++level) {
+        std::vector<HighsInt> indices = {
+            l_index[static_cast<std::size_t>(level)],
+            l_index[static_cast<std::size_t>(level + 1)],
+        };
+        std::vector<double> values = {-1.0, 1.0};
+        tyler_detail::require_highs_ok(
+            highs.addRow(-kHighsInf, 0.0, static_cast<HighsInt>(indices.size()), indices.data(), values.data()),
+            "adding precedence constraints");
     }
 
-    if (have_last_feasible) {
-        result.primal = last_feasible.primal;
+    for (std::size_t level = 0; level < ranges.size(); ++level) {
+        HierarchyLevelRange const& range = ranges[level];
+        double const level_bound = level_bounds[level];
+        for (int row = range.start; row < range.end; ++row) {
+            Eigen::VectorXd const coeffs = matrix.row(row).transpose();
+
+            std::vector<HighsInt> sat_indices(static_cast<std::size_t>(n + 1));
+            std::vector<double> sat_values(static_cast<std::size_t>(n + 1));
+            for (int col = 0; col < n; ++col) {
+                sat_indices[static_cast<std::size_t>(col)] = x_index[static_cast<std::size_t>(col)];
+                sat_values[static_cast<std::size_t>(col)] = coeffs(col);
+            }
+            sat_indices[static_cast<std::size_t>(n)] = l_index[level];
+            sat_values[static_cast<std::size_t>(n)] = level_bound;
+            tyler_detail::require_highs_ok(
+                highs.addRow(-kHighsInf, upper(row) + level_bound,
+                             static_cast<HighsInt>(sat_indices.size()), sat_indices.data(), sat_values.data()),
+                "adding satisfaction upper constraints");
+            for (int col = 0; col < n; ++col) {
+                sat_values[static_cast<std::size_t>(col)] = -coeffs(col);
+            }
+            tyler_detail::require_highs_ok(
+                highs.addRow(-kHighsInf, -lower(row) + level_bound,
+                             static_cast<HighsInt>(sat_indices.size()), sat_indices.data(), sat_values.data()),
+                "adding satisfaction lower constraints");
+
+            std::vector<HighsInt> phi_indices;
+            std::vector<double> phi_values;
+            phi_indices.reserve(static_cast<std::size_t>(n + 2 + level));
+            phi_values.reserve(static_cast<std::size_t>(n + 2 + level));
+            for (int col = 0; col < n; ++col) {
+                phi_indices.push_back(x_index[static_cast<std::size_t>(col)]);
+                phi_values.push_back(coeffs(col));
+            }
+            phi_indices.push_back(phi_index);
+            phi_values.push_back(-1.0);
+            phi_indices.push_back(l_index[level]);
+            phi_values.push_back(-level_bound);
+            for (std::size_t prev = 0; prev < level; ++prev) {
+                phi_indices.push_back(l_index[prev]);
+                phi_values.push_back(level_bound);
+            }
+            tyler_detail::require_highs_ok(
+                highs.addRow(-kHighsInf, upper(row) + level_bound * static_cast<double>(level),
+                             static_cast<HighsInt>(phi_indices.size()), phi_indices.data(), phi_values.data()),
+                "adding first-failed upper constraints");
+            for (int col = 0; col < n; ++col) {
+                phi_values[static_cast<std::size_t>(col)] = -coeffs(col);
+            }
+            tyler_detail::require_highs_ok(
+                highs.addRow(-kHighsInf, -lower(row) + level_bound * static_cast<double>(level),
+                             static_cast<HighsInt>(phi_indices.size()), phi_indices.data(), phi_values.data()),
+                "adding first-failed lower constraints");
+        }
     }
-    result.all_levels_satisfied = true;
+
+    for (int level = 0; level < levels; ++level) {
+        tyler_detail::require_highs_ok(
+            highs.changeColCost(l_index[static_cast<std::size_t>(level)], -objective_weight),
+            "setting Tyler objective weights");
+    }
+    tyler_detail::require_highs_ok(highs.changeColCost(phi_index, 1.0), "setting phi objective weight");
+
+    tyler_detail::require_highs_ok(highs.run(), "solving Tyler MILP");
+    tyler_detail::require_model_solution(highs, "solving Tyler MILP");
+    HighsSolution const& solution = highs.getSolution();
+
+    int const satisfied_levels = static_cast<int>(
+        std::llround(std::accumulate(solution.col_value.begin() + n,
+                                     solution.col_value.begin() + n + levels,
+                                     0.0)));
+    result.all_levels_satisfied = satisfied_levels == levels;
+    result.violation = solution.col_value[static_cast<std::size_t>(phi_index)];
+    result.first_failed_level = result.all_levels_satisfied ? -1 : satisfied_levels;
+    for (int col = 0; col < n; ++col) {
+        result.mip_primal(col) =
+            solution.col_value[static_cast<std::size_t>(x_index[static_cast<std::size_t>(col)])];
+    }
+    result.primal = result.mip_primal;
     return result;
 }
