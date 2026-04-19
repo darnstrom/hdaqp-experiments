@@ -4,6 +4,7 @@ using LinearAlgebra
 using Plots
 using Combinatorics
 using DelimitedFiles
+using Statistics
 include("obstacles.jl")
 include("simulate.jl")
 include("model.jl")
@@ -44,7 +45,8 @@ function mpc_experiments(;Np=30,Nc=Np,save_problems=true,plot=false)
         
         fname = save_problems ? "result/"*name*".h5" : nothing
 
-        Xs,Us,ts,tdaqp = simulate(mpc,obstacles,Ac,Bc;fname=fname)
+        Xs,Us,ts,tdaqp,setup_times = simulate(mpc,obstacles,Ac,Bc;fname=fname)
+        println("Median setup time: $(median(setup_times[2:end]))") # disregard first due to compile times
         plot && plot_scenario(ts,Xs,obstacles,W_line,tdaqp)
 
         αs = [Cy_hard*Xs[i]+[1;0;;]*Us[i] for i in 1:length(ts)]

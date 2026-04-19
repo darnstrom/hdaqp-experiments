@@ -41,3 +41,5 @@
 *.dwo
 
 mpc-example/Manifest.toml
+
+mpc-example/result/

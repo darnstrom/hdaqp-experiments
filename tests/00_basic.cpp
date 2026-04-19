@@ -2,9 +2,11 @@
 #include <iostream>
 
 #include <Eigen/Dense>
-#include <daqp/daqp.hpp>
+#include <daqp.hpp>
 #include "lexls_interface.hpp"
 #include "nipm_interface.hpp"
+#include "tyler_interface.hpp"
+#include "hierarchy_utils.hpp"
 
 int main() {
     // Task 0: -1 <= x <= 1
@@ -35,8 +37,9 @@ int main() {
 
     // DAQP
     DAQP daqp(3, 50, 5);
+    Eigen::VectorXi const normalized = normalized_breaks(breaks, matrix.rows());
     auto t_start = std::chrono::high_resolution_clock::now();
-    daqp.solve(matrix, upper, lower, (Eigen::VectorXi(1 + breaks.size()) << 0, breaks).finished());
+    daqp.solve(matrix, upper, lower, normalized);
     auto solution = daqp.get_primal();
     auto t_end = std::chrono::high_resolution_clock::now();
     auto daqp_time = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start);
@@ -62,6 +65,18 @@ int main() {
     auto nipm_time = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start);
     std::cout << "Solution NIPM-HLSP: " << solution.transpose() << std::endl;
     std::cout << "NIPM-HLSP execution time: " << nipm_time.count() << " μs" << std::endl;
+
+    // Tyler-HiGHS
+    t_start = std::chrono::high_resolution_clock::now();
+    auto tyler = tyler_from_stack(matrix, upper, lower, breaks);
+    t_end = std::chrono::high_resolution_clock::now();
+    auto tyler_time = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start);
+    std::cout << "Solution Tyler-HiGHS: " << tyler.primal.transpose() << std::endl;
+    std::cout << "Tyler-HiGHS execution time: " << tyler_time.count() << " μs" << std::endl;
+    if (!tyler.all_levels_satisfied) {
+        std::cout << "Tyler first failed level: " << tyler.first_failed_level
+                  << ", violation: " << tyler.violation << std::endl;
+    }
 
     double precision = 1e-5;
     return daqp.get_primal().isApprox(lexls.get_x(), precision) &&

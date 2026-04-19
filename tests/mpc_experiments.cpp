@@ -11,10 +11,12 @@
 
 #include <Eigen/Dense>
 #include <H5Cpp.h>
-#include <daqp/daqp.hpp>
+#include <daqp.hpp>
 
 #include "lexls_interface.hpp"
 #include "nipm_interface.hpp"
+#include "tyler_interface.hpp"
+#include "hierarchy_utils.hpp"
 
 namespace {
 
@@ -38,6 +40,14 @@ bool is_scenario_file(std::filesystem::path const& path) {
 }
 
 std::vector<std::filesystem::path> scenario_files(std::filesystem::path const& dir) {
+    if (!std::filesystem::exists(dir)) {
+        throw std::runtime_error("Missing MPC result directory " + dir.string() +
+                                 ". Generate scenario*.h5 files from mpc-example first.");
+    }
+    if (!std::filesystem::is_directory(dir)) {
+        throw std::runtime_error(dir.string() + " is not a directory");
+    }
+
     std::vector<std::filesystem::path> paths;
     for (auto const& entry : std::filesystem::directory_iterator(dir)) {
         if (entry.is_regular_file() && is_scenario_file(entry.path())) {
@@ -122,17 +132,6 @@ MPCProblem load_problem(H5::H5File const& file, int problem_idx) {
     };
 }
 
-int max_constraints_in_level(Eigen::VectorXi const& breaks) {
-    int level_start = 0;
-    int max_constraints = 0;
-    for (int k = 0; k < breaks.size(); ++k) {
-        int level_end = breaks(k);
-        max_constraints = std::max(max_constraints, level_end - level_start);
-        level_start = level_end;
-    }
-    return max_constraints;
-}
-
 double elapsed_seconds(std::chrono::high_resolution_clock::time_point start,
                        std::chrono::high_resolution_clock::time_point end) {
     auto dt = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -141,17 +140,19 @@ double elapsed_seconds(std::chrono::high_resolution_clock::time_point start,
 
 void write_scenario_times(std::filesystem::path const& output_path,
                           std::vector<double> const& t_values,
-                          Eigen::MatrixXd const& times) {
+                          Eigen::MatrixXd const& times,
+                          Eigen::VectorXd const& daqp_tyler_diff) {
     std::ofstream output(output_path);
     if (!output) {
         throw std::runtime_error("Failed to open " + output_path.string());
     }
 
     output << std::setprecision(17);
-    output << "problem t daqp lexls nipm\n";
+    output << "problem t daqp lexls nipm tyler daqp_tyler_diff\n";
     for (Eigen::Index i = 0; i < times.rows(); ++i) {
         output << i << " " << t_values[static_cast<std::size_t>(i)] << " " << times(i, 0) << " "
-               << times(i, 1) << " " << times(i, 2) << "\n";
+               << times(i, 1) << " " << times(i, 2) << " " << times(i, 3) << " "
+               << daqp_tyler_diff(i) << "\n";
     }
     if (!output) {
         throw std::runtime_error("Failed to write to " + output_path.string());
@@ -185,21 +186,25 @@ int main() {
             throw std::runtime_error("No problem groups found in " + scenario_path.string());
         }
 
-        Eigen::MatrixXd times(n_problems, 3);
+        Eigen::MatrixXd times(n_problems, 4);
+        Eigen::VectorXd daqp_tyler_diff(n_problems);
         std::vector<double> t_values(static_cast<std::size_t>(n_problems));
 
         for (int problem_idx = 0; problem_idx < n_problems; ++problem_idx) {
             // Load one problem at a time so peak memory stays bounded.
             MPCProblem const problem = load_problem(h5file, problem_idx);
             t_values[static_cast<std::size_t>(problem_idx)] = problem.t;
+            Eigen::VectorXi const normalized = normalized_breaks(problem.breaks, problem.matrix.rows());
+            Eigen::VectorXd daqp_primal(problem.matrix.cols());
 
             {
                 DAQP daqp(problem.matrix.cols(),
                           problem.upper.size(),
-                          max_constraints_in_level(problem.breaks));
+                          max_constraints_in_level(problem.breaks, problem.matrix.rows()));
                 auto t_start = std::chrono::high_resolution_clock::now();
-                daqp.solve(problem.matrix, problem.upper, problem.lower, problem.breaks);
+                daqp.solve(problem.matrix, problem.upper, problem.lower, normalized);
                 auto t_end = std::chrono::high_resolution_clock::now();
+                daqp_primal = daqp.get_primal();
                 times(static_cast<Eigen::Index>(problem_idx), 0) = elapsed_seconds(t_start, t_end);
             }
 
@@ -218,9 +223,22 @@ int main() {
                 auto t_end = std::chrono::high_resolution_clock::now();
                 times(static_cast<Eigen::Index>(problem_idx), 2) = elapsed_seconds(t_start, t_end);
             }
+
+            TylerResult tyler;
+            {
+                auto t_start = std::chrono::high_resolution_clock::now();
+                tyler = tyler_from_stack(problem.matrix, problem.upper, problem.lower, problem.breaks);
+                auto t_end = std::chrono::high_resolution_clock::now();
+                times(static_cast<Eigen::Index>(problem_idx), 3) = elapsed_seconds(t_start, t_end);
+            }
+
+            daqp_tyler_diff(static_cast<Eigen::Index>(problem_idx)) =
+                compute_lexdiff(compute_band_slacks(problem.matrix, problem.upper, problem.lower, daqp_primal),
+                                compute_band_slacks(problem.matrix, problem.upper, problem.lower, tyler.primal),
+                                problem.breaks);
         }
 
-        write_scenario_times(timings_path, t_values, times);
+        write_scenario_times(timings_path, t_values, times, daqp_tyler_diff);
         std::cout << " done." << std::endl;
     }
 
@@ -231,8 +249,8 @@ int main() {
         throw std::runtime_error("Failed to open summary output file");
     }
     summary_file << std::setprecision(17);
-    summary_file << "scenario daqpmin lexlsmin nipmmin daqpmean lexlsmean nipmmean "
-                    "daqpmax lexlsmax nipmmax\n";
+    summary_file << "scenario daqpmin lexlsmin nipmmin tylermin daqpmean lexlsmean nipmmean tylermean "
+                    "daqpmax lexlsmax nipmmax tylermax\n";
 
     for (auto const& scenario_path : scenarios) {
         std::string const scenario_name = scenario_path.stem().string();
@@ -246,13 +264,14 @@ int main() {
         std::string header;
         std::getline(in, header);
 
-        std::vector<double> daqp_times, lexls_times, nipm_times;
+        std::vector<double> daqp_times, lexls_times, nipm_times, tyler_times;
         int prob;
-        double t, d, l, n;
-        while (in >> prob >> t >> d >> l >> n) {
+        double t, d, l, n, y, diff;
+        while (in >> prob >> t >> d >> l >> n >> y >> diff) {
             daqp_times.push_back(d);
             lexls_times.push_back(l);
             nipm_times.push_back(n);
+            tyler_times.push_back(y);
         }
         if (in.bad()) {
             std::cerr << "Warning: I/O error reading " << timings_path << ", skipping from summary.\n";
@@ -274,11 +293,12 @@ int main() {
         auto [dmin, dmean, dmax] = stats(daqp_times);
         auto [lmin, lmean, lmax] = stats(lexls_times);
         auto [nmin, nmean, nmax] = stats(nipm_times);
+        auto [ymin, ymean, ymax] = stats(tyler_times);
 
         summary_file << scenario_name
-                     << " " << dmin  << " " << lmin  << " " << nmin
-                     << " " << dmean << " " << lmean << " " << nmean
-                     << " " << dmax  << " " << lmax  << " " << nmax
+                     << " " << dmin  << " " << lmin  << " " << nmin  << " " << ymin
+                     << " " << dmean << " " << lmean << " " << nmean << " " << ymean
+                     << " " << dmax  << " " << lmax  << " " << nmax  << " " << ymax
                      << "\n";
     }
 

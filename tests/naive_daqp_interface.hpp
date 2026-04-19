@@ -1,5 +1,7 @@
 #include <Eigen/Dense>
-#include <daqp/daqp.hpp>
+#include <daqp.hpp>
+
+#include "hierarchy_utils.hpp"
 
 // Solve an HQP naively using DAQP:
 //   - No warm starting between levels (fresh DAQP solves per level)
@@ -9,7 +11,8 @@ Eigen::VectorXd naive_daqp_from_stack(Eigen::MatrixXd const& matrix,
                                        Eigen::VectorXd const& lower,
                                        Eigen::VectorXi const& breaks) {
     int n  = matrix.cols();
-    int nh = breaks.size() - 1;
+    Eigen::VectorXi const normalized = normalized_breaks(breaks, matrix.rows());
+    int nh = normalized.size() - 1;
     // Small weight on z in phase 1 so the problem is non-degenerate while
     // still driving the solver to minimise the violation first.
     const double eps = 1e-9;
@@ -20,8 +23,8 @@ Eigen::VectorXd naive_daqp_from_stack(Eigen::MatrixXd const& matrix,
     Eigen::VectorXi no_breaks(0);
 
     for (int k = 0; k < nh; k++) {
-        int level_start = breaks(k);
-        int level_end   = breaks(k + 1);
+        int level_start = normalized(k);
+        int level_end   = normalized(k + 1);
         int m_k         = level_end - level_start;
         int n_ext       = n + m_k;   // [z; s_k]
 

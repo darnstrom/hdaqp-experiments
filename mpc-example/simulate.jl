@@ -7,6 +7,7 @@ function simulate(mpc,obstacles,Ac,Bc;nominal_constraints = mpc.constraints,
     Xs,Us = [],[]
     ts = 0:dt:T
     tdaqp = Float64[]
+    setup_times = Float64[]
 
     fid = isnothing(fname) ? nothing : h5open(fname, "w")
 
@@ -23,7 +24,8 @@ function simulate(mpc,obstacles,Ac,Bc;nominal_constraints = mpc.constraints,
             end
 
             # Setup MPC 
-            setup!(mpc)
+            setup_time = @elapsed setup!(mpc)
+            push!(setup_times,setup_time)
 
             # Save problems for test in C++ 
             isnothing(fid) || save_problem(fid,t,Int((k-1)/simfactor),mpc,x,u)
@@ -40,7 +42,7 @@ function simulate(mpc,obstacles,Ac,Bc;nominal_constraints = mpc.constraints,
         x += dt*(Ac*x+Bc*u);
     end
     isnothing(fid) || close(fid)
-    return Xs,Us,ts,tdaqp
+    return Xs,Us,ts,tdaqp,setup_times
 end
 
 function plot_scenario(ts,Xs,obstacles,W_line,tdaqp)

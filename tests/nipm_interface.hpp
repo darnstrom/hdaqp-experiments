@@ -1,15 +1,18 @@
 #include <nipm_hlsp/nipm_hlsp.h>
 
+#include "hierarchy_utils.hpp"
+
 nipmhlsp::NIpmHLSP nipm_from_stack(Eigen::MatrixXd const &matrix,
                                    Eigen::VectorXd const &upper,
                                    Eigen::VectorXd const &lower,
                                    Eigen::VectorXi const &breaks) {
-    int n_tasks = breaks.size();
+    Eigen::VectorXi const endpoints = task_endpoints(breaks, matrix.rows());
+    int n_tasks = endpoints.size();
     int n_variables = matrix.cols();
     nipmhlsp::NIpmHLSP solver{n_tasks, n_variables};
 
     for (int start = 0, k = 0; k < n_tasks; ++k) {
-        int n_constraints = breaks(k) - start;
+        int n_constraints = endpoints(k) - start;
         
         // Check equality row by row using Eigen array
         Eigen::Array<bool, Eigen::Dynamic, 1> is_equality(n_constraints);
@@ -51,7 +54,7 @@ nipmhlsp::NIpmHLSP nipm_from_stack(Eigen::MatrixXd const &matrix,
         // Set data with separated equality and inequality constraints
         solver.setData(k, A_eq, b_eq, A_ineq, b_ineq);
         
-        start = breaks(k);
+        start = endpoints(k);
     }
 
     return solver;
