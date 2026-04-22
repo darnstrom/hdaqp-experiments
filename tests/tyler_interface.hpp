@@ -23,6 +23,8 @@ struct TylerResult {
 
 namespace tyler_detail {
 
+constexpr double kPracticalInfinity = 1e20;
+
 inline void require_highs_ok(HighsStatus status, std::string const& context) {
     if (status != HighsStatus::kOk) {
         throw std::runtime_error("HiGHS error while " + context);
@@ -44,10 +46,39 @@ inline double max_abs(Eigen::VectorXd const& vector) {
     return vector.size() == 0 ? 0.0 : vector.cwiseAbs().maxCoeff();
 }
 
+inline bool has_finite_upper(double value) {
+    return std::isfinite(value) && value < kPracticalInfinity;
+}
+
+inline bool has_finite_lower(double value) {
+    return std::isfinite(value) && value > -kPracticalInfinity;
+}
+
+inline bool has_usable_upper_rhs(double value) {
+    return std::isfinite(value) && value < kPracticalInfinity;
+}
+
+inline bool has_usable_lower_rhs(double value) {
+    return std::isfinite(value) && value < kPracticalInfinity;
+}
+
+inline double bounded_max_abs(Eigen::VectorXd const& vector, bool upper_like) {
+    double max_value = 0.0;
+    for (Eigen::Index i = 0; i < vector.size(); ++i) {
+        double const value = vector(i);
+        bool const usable = upper_like ? has_finite_upper(value) : has_finite_lower(value);
+        if (usable) {
+            max_value = std::max(max_value, std::abs(value));
+        }
+    }
+    return max_value;
+}
+
 inline double tyler_variable_bound(Eigen::MatrixXd const& matrix,
                                    Eigen::VectorXd const& upper,
                                    Eigen::VectorXd const& lower) {
-    double const bound_scale = std::max({1.0, max_abs(upper), max_abs(lower)});
+    double const bound_scale =
+        std::max({1.0, bounded_max_abs(upper, true), bounded_max_abs(lower, false)});
     double const dimension_scale = std::sqrt(static_cast<double>(std::max<Eigen::Index>(1, matrix.cols())));
     return std::max(10.0, 10.0 * bound_scale * dimension_scale + 1.0);
 }
@@ -59,8 +90,10 @@ inline std::vector<double> row_relaxation_bounds(Eigen::MatrixXd const& matrix,
     std::vector<double> row_bounds(static_cast<std::size_t>(matrix.rows()), 0.0);
     for (Eigen::Index row = 0; row < matrix.rows(); ++row) {
         double const activity_bound = matrix.row(row).cwiseAbs().sum() * variable_bound;
-        double const upper_violation = std::max(0.0, activity_bound - upper(row));
-        double const lower_violation = std::max(0.0, activity_bound + lower(row));
+        double const upper_violation =
+            has_finite_upper(upper(row)) ? std::max(0.0, activity_bound - upper(row)) : 0.0;
+        double const lower_violation =
+            has_finite_lower(lower(row)) ? std::max(0.0, activity_bound + lower(row)) : 0.0;
         row_bounds[static_cast<std::size_t>(row)] = std::max(upper_violation, lower_violation);
     }
     return row_bounds;
@@ -146,6 +179,12 @@ inline TylerResult tyler_from_stack(Eigen::MatrixXd const& matrix,
         double const level_bound = level_bounds[level];
         for (int row = range.start; row < range.end; ++row) {
             Eigen::VectorXd const coeffs = matrix.row(row).transpose();
+            bool const has_upper = tyler_detail::has_finite_upper(upper(row));
+            bool const has_lower = tyler_detail::has_finite_lower(lower(row));
+            double const satisfaction_upper_rhs = upper(row) + level_bound;
+            double const satisfaction_lower_rhs = -lower(row) + level_bound;
+            double const failed_upper_rhs = upper(row) + level_bound * static_cast<double>(level);
+            double const failed_lower_rhs = -lower(row) + level_bound * static_cast<double>(level);
 
             std::vector<HighsInt> sat_indices(static_cast<std::size_t>(n + 1));
             std::vector<double> sat_values(static_cast<std::size_t>(n + 1));
@@ -155,17 +194,28 @@ inline TylerResult tyler_from_stack(Eigen::MatrixXd const& matrix,
             }
             sat_indices[static_cast<std::size_t>(n)] = l_index[level];
             sat_values[static_cast<std::size_t>(n)] = level_bound;
-            tyler_detail::require_highs_ok(
-                highs.addRow(-kHighsInf, upper(row) + level_bound,
-                             static_cast<HighsInt>(sat_indices.size()), sat_indices.data(), sat_values.data()),
-                "adding satisfaction upper constraints");
-            for (int col = 0; col < n; ++col) {
-                sat_values[static_cast<std::size_t>(col)] = -coeffs(col);
+            if (has_upper && tyler_detail::has_usable_upper_rhs(satisfaction_upper_rhs)) {
+                HighsStatus const status =
+                    highs.addRow(-kHighsInf, satisfaction_upper_rhs,
+                                 static_cast<HighsInt>(sat_indices.size()), sat_indices.data(), sat_values.data());
+                if (status != HighsStatus::kOk) {
+                    throw std::runtime_error("HiGHS error while adding satisfaction upper constraints"
+                                             " at level " + std::to_string(level) +
+                                             ", row " + std::to_string(row) +
+                                             ", upper " + std::to_string(upper(row)) +
+                                             ", rhs " + std::to_string(satisfaction_upper_rhs) +
+                                             ", level_bound " + std::to_string(level_bound));
+                }
             }
-            tyler_detail::require_highs_ok(
-                highs.addRow(-kHighsInf, -lower(row) + level_bound,
-                             static_cast<HighsInt>(sat_indices.size()), sat_indices.data(), sat_values.data()),
-                "adding satisfaction lower constraints");
+            if (has_lower && tyler_detail::has_usable_lower_rhs(satisfaction_lower_rhs)) {
+                for (int col = 0; col < n; ++col) {
+                    sat_values[static_cast<std::size_t>(col)] = -coeffs(col);
+                }
+                tyler_detail::require_highs_ok(
+                    highs.addRow(-kHighsInf, satisfaction_lower_rhs,
+                                 static_cast<HighsInt>(sat_indices.size()), sat_indices.data(), sat_values.data()),
+                    "adding satisfaction lower constraints");
+            }
 
             std::vector<HighsInt> phi_indices;
             std::vector<double> phi_values;
@@ -183,17 +233,21 @@ inline TylerResult tyler_from_stack(Eigen::MatrixXd const& matrix,
                 phi_indices.push_back(l_index[prev]);
                 phi_values.push_back(level_bound);
             }
-            tyler_detail::require_highs_ok(
-                highs.addRow(-kHighsInf, upper(row) + level_bound * static_cast<double>(level),
-                             static_cast<HighsInt>(phi_indices.size()), phi_indices.data(), phi_values.data()),
-                "adding first-failed upper constraints");
-            for (int col = 0; col < n; ++col) {
-                phi_values[static_cast<std::size_t>(col)] = -coeffs(col);
+            if (has_upper && tyler_detail::has_usable_upper_rhs(failed_upper_rhs)) {
+                tyler_detail::require_highs_ok(
+                    highs.addRow(-kHighsInf, failed_upper_rhs,
+                                 static_cast<HighsInt>(phi_indices.size()), phi_indices.data(), phi_values.data()),
+                    "adding first-failed upper constraints");
             }
-            tyler_detail::require_highs_ok(
-                highs.addRow(-kHighsInf, -lower(row) + level_bound * static_cast<double>(level),
-                             static_cast<HighsInt>(phi_indices.size()), phi_indices.data(), phi_values.data()),
-                "adding first-failed lower constraints");
+            if (has_lower && tyler_detail::has_usable_lower_rhs(failed_lower_rhs)) {
+                for (int col = 0; col < n; ++col) {
+                    phi_values[static_cast<std::size_t>(col)] = -coeffs(col);
+                }
+                tyler_detail::require_highs_ok(
+                    highs.addRow(-kHighsInf, failed_lower_rhs,
+                                 static_cast<HighsInt>(phi_indices.size()), phi_indices.data(), phi_values.data()),
+                    "adding first-failed lower constraints");
+            }
         }
     }
 

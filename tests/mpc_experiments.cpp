@@ -227,7 +227,12 @@ int main() {
             TylerResult tyler;
             {
                 auto t_start = std::chrono::high_resolution_clock::now();
-                tyler = tyler_from_stack(problem.matrix, problem.upper, problem.lower, problem.breaks);
+                try {
+                    tyler = tyler_from_stack(problem.matrix, problem.upper, problem.lower, problem.breaks);
+                } catch (std::exception const& error) {
+                    throw std::runtime_error("Tyler failed for " + scenario_name + " problem" +
+                                             std::to_string(problem_idx) + ": " + error.what());
+                }
                 auto t_end = std::chrono::high_resolution_clock::now();
                 times(static_cast<Eigen::Index>(problem_idx), 3) = elapsed_seconds(t_start, t_end);
             }
